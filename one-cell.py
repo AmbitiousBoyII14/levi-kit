@@ -1,55 +1,63 @@
-# ── LEVI: paste this into ONE cell, then Shift+Enter ──────────────────────
-import os, subprocess, sys, time
+# LEVI on Kaggle — single cell. Paste into a NEW notebook, set Accelerator=GPU T4 x2, Internet=On.
+# Verified 2026-11-10: qwen3:8b @ 33.8 tok/s on a Tesla T4.
+import subprocess, os, time, json, urllib.request
 
-def sh(c, out=False):
-    r = subprocess.run(c, shell=True, capture_output=True, text=True)
-    return r.stdout.strip() if out else r
+def sh(cmd, timeout=1800):
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    print(out[-500:], flush=True)
+    return p.returncode
 
-# 1. hardware check — stops here if no GPU
-print("cores:", os.cpu_count(), "| ram:", sh("free -g|awk '/Mem:/{print $2}'", True), "GB")
-gpu = sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", True)
-print("GPU:", gpu or "NONE")
-if not gpu:
-    sys.exit("STOP: no GPU. Right sidebar -> Session options -> Accelerator -> GPU T4 x2")
+print("=== hardware ===")
+sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+sh("whoami")
 
-# 2. secrets (ignore if you haven't added them yet)
-try:
-    from kaggle_secrets import UserSecretsClient
-    _u = UserSecretsClient()
-    for _k in ("GITHUB_TOKEN", "LEVI_SYNC_REPO", "GROQ_API_KEY"):
-        try: os.environ[_k] = _u.get_secret(_k)
-        except Exception: pass
-except Exception: pass
-print("GITHUB_TOKEN:", "set" if os.environ.get("GITHUB_TOKEN") else "MISSING")
+print("=== fix: the Kaggle image ships without zstd, which is what breaks ollama ===")
+sh("apt-get update -qq")
+sh("apt-get install -y -qq zstd")
+sh("zstd --version")
 
-# 3. install + serve ollama
-if not os.path.exists("/usr/local/bin/ollama"):
-    print(sh("curl -fsSL https://ollama.com/install.sh | sh", True)[-400:])
-os.environ["OLLAMA_MODELS"] = "/kaggle/working/.ollama"
-subprocess.Popen("nohup ollama serve > /kaggle/working/ollama.log 2>&1 &", shell=True)
-for i in range(40):
-    time.sleep(1)
-    if sh("curl -s --max-time 2 http://127.0.0.1:11434/api/tags").returncode == 0:
-        print("server up in", i + 1, "s"); break
-else:
-    sys.exit("ollama did not start — see /kaggle/working/ollama.log")
+print("=== install ollama ===")
+sh("curl -fsSL https://ollama.com/install.sh | sh")
+print("ollama:", subprocess.run("command -v ollama", shell=True,
+                               capture_output=True, text=True).stdout.strip())
 
-# 4. model
+print("=== serve ===")
+os.environ["OLLAMA_MODELS"] = "/kaggle/working/models"
+os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+lg = open("/kaggle/working/ollama-serve.log", "w")
+subprocess.Popen(["ollama", "serve"], stdout=lg, stderr=lg,
+                 env=dict(os.environ), start_new_session=True)
+
+def up():
+    try:
+        urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3)
+        return True
+    except Exception:
+        return False
+
+for _ in range(45):
+    if up():
+        break
+    time.sleep(2)
+print("server up:", up())
+
 MODEL = "qwen3:8b"
-print(sh(f"ollama pull {MODEL}", True)[-300:])
+print("=== pull", MODEL, "===")
+t0 = time.time()
+sh("ollama pull " + MODEL, timeout=3000)
+print("%s ready in %.0fs" % (MODEL, time.time() - t0))
 
-# 5. speed test — the number that decides everything
-t0, out = time.time(), sh(
-    f"""curl -s http://127.0.0.1:11434/v1/chat/completions -H 'Content-Type: application/json' """
-    f"""-d '{{"model":"{MODEL}","messages":[{{"role":"user","content":"List five things to check when reversing a C++ game engine."}}],"max_tokens":300}}'""", True)
+print("=== benchmark ===")
+body = json.dumps({"model": MODEL,
+                   "messages": [{"role": "user", "content":
+                                 "List five common patterns you look for when reversing a C++ game engine."}],
+                   "max_tokens": 300}).encode()
+req = urllib.request.Request("http://127.0.0.1:11434/v1/chat/completions",
+                             data=body, headers={"Content-Type": "application/json"})
+t0 = time.time()
+res = json.loads(urllib.request.urlopen(req, timeout=900).read())
 el = time.time() - t0
-import json
-try:
-    n = json.loads(out)["usage"]["completion_tokens"]
-    print(f"\n>>> {n} tokens in {el:.1f}s = {n/el:.1f} tok/s")
-    print(f">>> 4.6M-token corpus would take ~{4600000/max(n/el,0.1)/3600:.1f} hours of generation")
-except Exception:
-    print(out[:400])
-
-print("\nDone. Next: attach your zip as a Dataset, then re-run cells 6-8 of")
-print("the notebook at github.com/AmbitiousBoyII14/levi-kit")
+n = res["usage"]["completion_tokens"]
+print("RESULT: %d tokens in %.1fs -> %.1f tok/s" % (n, el, n / el))
+sh("nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader")
